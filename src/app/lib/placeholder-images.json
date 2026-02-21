@@ -1,0 +1,17 @@
+
+{
+  "placeholderImages": [
+    {
+      "id": "map-background",
+      "description": "A clean, modern map interface background",
+      "imageUrl": "https://picsum.photos/seed/map123/1200/800",
+      "imageHint": "city map"
+    },
+    {
+      "id": "app-hero",
+      "description": "Safe tracking illustration",
+      "imageUrl": "https://picsum.photos/seed/safety/800/600",
+      "imageHint": "security tracking"
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /**
+     * Güvenli İz - Firestore Security Rules
+     *
+     * Core Philosophy:
+     * This ruleset enforces a strict ownership model for user profiles and a hybrid 
+     * access model for tracking sessions. It prioritizes "Authorization Independence," 
+     * meaning rules rely on data within the document itself or the path, rather 
+     * than performing expensive cross-document lookups.
+     *
+     * Data Structure:
+     * - /users/{userId}: Private user profiles where the document ID matches the UID.
+     * - /trackerSessions/{trackingCode}: Tracking sessions where the document ID is 
+     *   the unique AI-generated code.
+     *
+     * Key Security Decisions:
+     * 1. Path-Based Ownership: User data is secured by matching the {userId} in the 
+     *    path to the requester's UID.
+     * 2. Direct Access for Receivers: Receivers access sessions directly via the 
+     *    tracking code (document ID). Read access is granted if the session is 
+     *    marked 'isActive'.
+     * 3. Prevent Code Enumeration: General listing of tracker sessions is restricted 
+     *    to prevent unauthorized users from discovering active tracking codes.
+     * 4. Denormalization: The 'transmitterUserId' is stored directly on session 
+     *    documents to allow for fast, single-document ownership checks.
+     */
+
+    // --- Helper Functions ---
+
+    /** @description Checks if the requester is authenticated. */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /** @description Checks if the requester's UID matches the provided userId. */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /** 
+     * @description Combines existence check with ownership. 
+     * Used for update/delete to ensure the document exists and belongs to the user.
+     */
+    function isExistingOwner(ownerId) {
+      return resource != null && isOwner(ownerId);
+    }
+
+    // --- Collection Rules ---
+
+    /**
+     * @description Rules for user profiles. Enforces strict path-based ownership.
+     * @path /users/{userId}
+     * @allow Authenticated user (create) their own profile if the data 'id' matches the path.
+     * @deny Any user (get) or (update) a profile that does not belong to their UID.
+     * @principle Restricts access to a user's own data tree using path-based identity.
+     */
+    match /users/{userId} {
+      allow get, list: if isOwner(userId);
+      
+      allow create: if isOwner(userId) 
+                    && request.resource.data.id == userId;
+      
+      allow update: if isExistingOwner(userId) 
+                    && request.resource.data.id == resource.data.id;
+      
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Rules for tracking sessions. 
+     * Transmitters (owners) have full CUD access. 
+     * Receivers (guests) can only read if they have the specific code and the session is active.
+     * @path /trackerSessions/{trackingCode}
+     * @allow Authenticated user (get) a session if they are the transmitter OR if isActive is true.
+     * @deny Any user (list) all sessions (prevents code guessing/enumeration).
+     * @principle Uses denormalized ownership for writes and conditional direct-access for reads.
+     */
+    match /trackerSessions/{trackingCode} {
+      
+      // Receivers can 'get' if they know the code and it is active. 
+      // Owners can always 'get' their own sessions.
+      allow get: if isSignedIn() && (
+        resource.data.transmitterUserId == request.auth.uid || 
+        resource.data.isActive == true
+      );
+
+      // List is restricted to the owner to prevent code enumeration.
+      // Users can only query sessions where they are the transmitter.
+      allow list: if isSignedIn() && (
+        resource == null || resource.data.transmitterUserId == request.auth.uid
+      );
+
+      // On create, ensure the transmitterUserId is correctly linked to the authenticated user.
+      allow create: if isSignedIn() 
+                    && request.resource.data.transmitterUserId == request.auth.uid;
+
+      // Only the transmitter can update or delete the session.
+      // Relational integrity: transmitterUserId must remain immutable.
+      allow update: if isExistingOwner(resource.data.transmitterUserId) 
+                    && request.resource.data.transmitterUserId == resource.data.transmitterUserId;
+      
+      allow delete: if isExistingOwner(resource.data.transmitterUserId);
+    }
+  }
+}

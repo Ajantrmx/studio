@@ -5,18 +5,40 @@ import { useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
-import { Shield, Radio, MapPin, Share2, Loader2, StopCircle } from "lucide-react";
-import { generateTrackingCode, saveTrackingSession, TrackingData } from "@/lib/tracking";
+import { Radio, MapPin, Share2, Loader2, StopCircle, ArrowLeft } from "lucide-react";
+import { generateTrackingCode, TrackingData } from "@/lib/tracking";
 import Link from "next/link";
+import { useFirebase, useUser, useMemoFirebase } from "@/firebase";
+import { initiateAnonymousSignIn } from "@/firebase/non-blocking-login";
+import { doc, serverTimestamp } from "firebase/firestore";
+import { setDocumentNonBlocking, updateDocumentNonBlocking } from "@/firebase/non-blocking-updates";
 
 export default function SenderPage() {
+  const { auth, firestore } = useFirebase();
+  const { user, isUserLoading } = useUser();
   const [isActive, setIsActive] = useState(false);
   const [trackingCode, setTrackingCode] = useState<string | null>(null);
   const [location, setLocation] = useState<{ lat: number; lon: number } | null>(null);
   const [isInitializing, setIsInitializing] = useState(false);
   const { toast } = useToast();
 
+  // Ensure user is signed in anonymously to interact with Firestore
+  useEffect(() => {
+    if (!isUserLoading && !user) {
+      initiateAnonymousSignIn(auth);
+    }
+  }, [user, isUserLoading, auth]);
+
   const startTracking = async () => {
+    if (!user) {
+      toast({
+        variant: "destructive",
+        title: "Giriş Gerekli",
+        description: "Bağlantı kurulurken lütfen bekleyin...",
+      });
+      return;
+    }
+
     setIsInitializing(true);
     if (!navigator.geolocation) {
       toast({
@@ -31,40 +53,52 @@ export default function SenderPage() {
     try {
       const code = generateTrackingCode();
       setTrackingCode(code);
-      setIsActive(true);
-
-      // Initial update
+      
       navigator.geolocation.getCurrentPosition((pos) => {
         const initialLoc = { lat: pos.coords.latitude, lon: pos.coords.longitude };
         setLocation(initialLoc);
         
-        const initialData: TrackingData = {
+        const sessionRef = doc(firestore, "trackerSessions", code);
+        const initialData: any = {
           id: code,
-          lat: initialLoc.lat,
-          lon: initialLoc.lon,
-          timestamp: Date.now(),
-          history: [{ ...initialLoc, timestamp: Date.now() }],
-          active: true
+          trackingCode: code,
+          transmitterUserId: user.uid,
+          isActive: true,
+          createdAt: new Date().toISOString(),
+          lastKnownLatitude: initialLoc.lat,
+          lastKnownLongitude: initialLoc.lon,
+          lastUpdated: new Date().toISOString(),
+          history: [{ ...initialLoc, timestamp: Date.now() }]
         };
-        saveTrackingSession(initialData);
-      });
 
-      toast({
-        title: "Takip Başlatıldı",
-        description: `Kodunuz: ${code}. Lütfen bu kodu alıcıyla paylaşın.`,
+        setDocumentNonBlocking(sessionRef, initialData, { merge: true });
+        setIsActive(true);
+        
+        toast({
+          title: "Takip Başlatıldı",
+          description: `Kodunuz: ${code}. Lütfen bu kodu alıcıyla paylaşın.`,
+        });
+      }, (err) => {
+        toast({
+          variant: "destructive",
+          title: "Konum Hatası",
+          description: "Konum erişimi reddedildi.",
+        });
+        setIsInitializing(false);
       });
     } catch (err) {
-      toast({
-        variant: "destructive",
-        title: "Bağlantı Hatası",
-        description: "Konum erişimi sağlanamadı.",
-      });
+      console.error(err);
+      setIsInitializing(false);
     } finally {
       setIsInitializing(false);
     }
   };
 
   const stopTracking = () => {
+    if (trackingCode) {
+      const sessionRef = doc(firestore, "trackerSessions", trackingCode);
+      updateDocumentNonBlocking(sessionRef, { isActive: false });
+    }
     setIsActive(false);
     setTrackingCode(null);
     setLocation(null);
@@ -74,36 +108,36 @@ export default function SenderPage() {
     });
   };
 
-  // Continuous location update simulation
+  // Continuous location update
   useEffect(() => {
     let interval: NodeJS.Timeout;
-    if (isActive && trackingCode) {
+    if (isActive && trackingCode && user) {
       interval = setInterval(() => {
         navigator.geolocation.getCurrentPosition((pos) => {
           const newLoc = { lat: pos.coords.latitude, lon: pos.coords.longitude };
           setLocation(newLoc);
           
-          const existing = JSON.parse(localStorage.getItem("guvenli_iz_sessions") || "{}")[trackingCode] || {};
-          const updated: TrackingData = {
-            ...existing,
-            lat: newLoc.lat,
-            lon: newLoc.lon,
-            timestamp: Date.now(),
-            history: [...(existing.history || []), { ...newLoc, timestamp: Date.now() }].slice(-100), // Keep last 100 points
-            active: true
-          };
-          saveTrackingSession(updated);
+          const sessionRef = doc(firestore, "trackerSessions", trackingCode);
+          // We can't easily fetch current history here without useDoc, 
+          // but for simple updates we just update the core fields.
+          // Note: In a production app, we'd use a cloud function or 
+          // a more sophisticated way to append to history.
+          updateDocumentNonBlocking(sessionRef, {
+            lastKnownLatitude: newLoc.lat,
+            lastKnownLongitude: newLoc.lon,
+            lastUpdated: new Date().toISOString()
+          });
         });
-      }, 5000); // Update every 5 seconds
+      }, 10000); // Update every 10 seconds to save on writes
     }
     return () => clearInterval(interval);
-  }, [isActive, trackingCode]);
+  }, [isActive, trackingCode, user, firestore]);
 
   return (
     <div className="min-h-screen p-6 flex flex-col items-center justify-center">
       <div className="w-full max-w-md space-y-6">
         <Link href="/" className="inline-flex items-center text-sm text-muted-foreground hover:text-primary transition-colors">
-          <Loader2 className="w-4 h-4 mr-1 animate-spin" style={{ animationDuration: '3s' }} />
+          <ArrowLeft className="w-4 h-4 mr-1" />
           Ana Sayfaya Dön
         </Link>
 
@@ -121,7 +155,7 @@ export default function SenderPage() {
             <CardContent className="space-y-4">
               <Button 
                 onClick={startTracking} 
-                disabled={isInitializing}
+                disabled={isInitializing || isUserLoading}
                 className="w-full h-16 text-lg font-bold shadow-lg bg-primary hover:bg-primary/90"
               >
                 {isInitializing ? <Loader2 className="w-6 h-6 animate-spin" /> : "Paylaşımı Başlat"}
@@ -167,14 +201,16 @@ export default function SenderPage() {
                 variant="outline" 
                 className="w-full h-12 border-primary/30 text-primary hover:bg-primary/5"
                 onClick={() => {
-                  navigator.share?.({
-                    title: 'Güvenli İz Takip Kodu',
-                    text: `Beni Güvenli İz uygulaması üzerinden takip edebilirsin. Kodum: ${trackingCode}`,
-                    url: window.location.origin
-                  }).catch(() => {
+                  if (navigator.share) {
+                    navigator.share({
+                      title: 'Güvenli İz Takip Kodu',
+                      text: `Beni Güvenli İz uygulaması üzerinden takip edebilirsin. Kodum: ${trackingCode}`,
+                      url: window.location.origin
+                    }).catch(console.error);
+                  } else {
                     navigator.clipboard.writeText(trackingCode || "");
                     toast({ title: "Kopyalandı", description: "Kod panoya kopyalandı." });
-                  });
+                  }
                 }}
               >
                 <Share2 className="w-4 h-4 mr-2" /> Kodu Paylaş
